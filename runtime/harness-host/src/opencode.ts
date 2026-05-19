@@ -124,7 +124,55 @@ export function mapEventV2ToRunnerEvent(
   }
 }
 
+function resolveOpencodeProviderType(modelProxyProvider: string): string {
+  const normalized = modelProxyProvider.trim().toLowerCase();
+  switch (normalized) {
+    case "openai_compatible":
+      return "openai";
+    case "anthropic_native":
+      return "anthropic";
+    case "google_compatible":
+      return "google";
+    default:
+      throw new Error(
+        `unsupported model_proxy_provider for opencode harness: "${modelProxyProvider}". ` +
+        `supported values: openai_compatible, anthropic_native, google_compatible`,
+      );
+  }
+}
+
 function buildOpencodeConfig(request: HarnessHostOpencodeRequest): Record<string, unknown> {
+  const modelClient = request.model_client;
+  if (!modelClient.api_key) {
+    throw new Error(
+      "opencode harness requires model_client.api_key from holaOS runtime config. " +
+      "ensure runtime-config.json has a provider with api_key configured.",
+    );
+  }
+  if (!modelClient.base_url) {
+    throw new Error(
+      "opencode harness requires model_client.base_url from holaOS runtime config. " +
+      "ensure runtime-config.json has a provider with base_url configured.",
+    );
+  }
+  const modelProxyProvider = modelClient.model_proxy_provider ?? "";
+  if (!modelProxyProvider) {
+    throw new Error(
+      "opencode harness requires model_client.model_proxy_provider from holaOS runtime config. " +
+      "this is resolved automatically by agent-runtime-config.ts from your provider kind.",
+    );
+  }
+  const providerType = resolveOpencodeProviderType(modelProxyProvider);
+
+  const providerConfig: Record<string, unknown> = {
+    type: providerType,
+    apiKey: modelClient.api_key,
+    baseURL: modelClient.base_url,
+  };
+  if (modelClient.default_headers && Object.keys(modelClient.default_headers).length > 0) {
+    providerConfig.headers = modelClient.default_headers;
+  }
+
   const mcpServers: Record<string, unknown> = {};
   const runtimeApiUrl = request.runtime_api_base_url;
   if (runtimeApiUrl) {
@@ -146,13 +194,10 @@ function buildOpencodeConfig(request: HarnessHostOpencodeRequest): Record<string
       mcpServers[name] = server.config ?? {};
     }
   }
-  const modelClient = request.model_client;
   return {
     provider: {
       "holaboss-proxy": {
-        type: "openai",
-        url: modelClient.base_url ?? "http://127.0.0.1:4000/openai/v1",
-        apiKey: modelClient.api_key,
+        ...providerConfig,
         models: {
           default: request.model_id,
         },
