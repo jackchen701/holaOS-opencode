@@ -327,7 +327,9 @@ export async function runOpencode(request: HarnessHostOpencodeRequest): Promise<
   try {
     const config = buildOpencodeConfig(request);
 
-    const opencodeBin = process.env.HOLABOSS_OPENCODE_BIN ?? "opencode";
+    const opencodeBin =
+      process.env.HOLABOSS_OPENCODE_BIN ??
+      (process.env.HOME ? `${process.env.HOME}/.opencode/bin/opencode` : "opencode");
 
     proc = spawn(opencodeBin, ["serve", "--port=0"], {
       cwd: request.workspace_dir,
@@ -434,7 +436,9 @@ export async function runOpencode(request: HarnessHostOpencodeRequest): Promise<
 
 export async function compactOpencodeSession(request: HarnessHostOpencodeRequest): Promise<{ compacted: boolean }> {
   const config = buildOpencodeConfig(request);
-  const opencodeBin = process.env.HOLABOSS_OPENCODE_BIN ?? "opencode";
+  const opencodeBin =
+    process.env.HOLABOSS_OPENCODE_BIN ??
+    (process.env.HOME ? `${process.env.HOME}/.opencode/bin/opencode` : "opencode");
 
   const proc = spawn(opencodeBin, ["serve", "--port=0"], {
     cwd: request.workspace_dir,
