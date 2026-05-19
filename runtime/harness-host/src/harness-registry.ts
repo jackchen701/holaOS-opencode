@@ -1,11 +1,17 @@
 import { HARNESS_DEFINITIONS, type HarnessHostPlugin } from "../../harnesses/src/index.js";
 import { decodeHarnessHostPiRequestBase64 } from "./contracts.js";
+import { decodeHarnessHostOpencodeRequestBase64 } from "./opencode-contracts.js";
 import { runPi } from "./pi.js";
+import { runOpencode } from "./opencode.js";
 
 const HARNESS_HOST_IMPLEMENTATIONS = {
   pi: {
     decodeRequestBase64: (encoded: string) => decodeHarnessHostPiRequestBase64(encoded),
     run: async (request: unknown) => await runPi(request as Parameters<typeof runPi>[0]),
+  },
+  opencode: {
+    decodeRequestBase64: (encoded: string) => decodeHarnessHostOpencodeRequestBase64(encoded),
+    run: async (request: unknown) => await runOpencode(request as Parameters<typeof runOpencode>[0]),
   },
 } as const;
 

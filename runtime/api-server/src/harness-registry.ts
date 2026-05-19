@@ -142,6 +142,7 @@ function requireBaseAdapter(harnessId: string): RuntimeHarnessAdapter {
 }
 
 const piAdapter = requireBaseAdapter("pi");
+const opencodeAdapter = requireBaseAdapter("opencode");
 
 const piRuntimeHarnessPlugin: RuntimeHarnessPlugin = {
   id: "pi",
@@ -215,7 +216,45 @@ const piRuntimeHarnessPlugin: RuntimeHarnessPlugin = {
   }
 };
 
-const HARNESS_PLUGINS = [piRuntimeHarnessPlugin] as const;
+const opencodeRuntimeHarnessPlugin: RuntimeHarnessPlugin = {
+  id: "opencode",
+  adapter: opencodeAdapter,
+  stageBrowserTools() {
+    return { changed: false, toolIds: [] };
+  },
+  stageRuntimeTools() {
+    return { changed: false, toolIds: [...RUNTIME_AGENT_TOOL_IDS] };
+  },
+  stageCommands() {
+    return { changed: false, commandIds: [] };
+  },
+  stageSkills() {
+    return { changed: false, skillIds: [] };
+  },
+  async prepareRun(_params) {},
+  async describeRuntimeStatus(params) {
+    const harnessStatus = await opencodeAdapter.describeRuntimeStatus({
+      configLoaded: params.configLoaded,
+      backendConfigPresent: false,
+      backendReadinessTarget: null,
+      probeBackendReadiness: params.probeBackendReadiness
+    });
+    return {
+      backendConfigPresent: false,
+      harnessStatus
+    };
+  },
+  async handleRuntimeConfigUpdated(_params) {},
+  async ensureReady(_fetchImpl) {},
+  backendBaseUrl(_params) {
+    return "";
+  },
+  timeoutSeconds(params) {
+    return defaultHarnessTimeoutSeconds(params.request.session_kind);
+  }
+};
+
+const HARNESS_PLUGINS = [piRuntimeHarnessPlugin, opencodeRuntimeHarnessPlugin] as const;
 const HARNESS_ADAPTERS = HARNESS_PLUGINS.map((plugin) => plugin.adapter);
 
 export function normalizeHarnessId(value: unknown): string {

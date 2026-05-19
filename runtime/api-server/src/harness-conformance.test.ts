@@ -67,7 +67,7 @@ function baseBuildParams() {
   };
 }
 
-test("shared harness definitions expose only the pi harness", () => {
+test("shared harness definitions expose the pi and opencode harnesses", () => {
   assert.deepEqual(
     HARNESS_DEFINITIONS.map((definition) => ({
       id: definition.id,
@@ -108,6 +108,24 @@ test("shared harness definitions expose only the pi harness", () => {
           bootstrapResolvedApplications: true,
         },
       },
+      {
+        id: "opencode",
+        hostCommand: "run-opencode",
+        capabilities: {
+          requiresBackend: false,
+          supportsStructuredOutput: false,
+          supportsWaitingUser: true,
+          supportsSkills: true,
+          supportsMcpTools: true,
+        },
+        prepPlan: {
+          stageWorkspaceSkills: false,
+          stageWorkspaceCommands: false,
+          prepareMcpTooling: true,
+          startWorkspaceMcpSidecar: true,
+          bootstrapResolvedApplications: true,
+        },
+      },
     ]
   );
 });
@@ -123,4 +141,18 @@ test("shared harness definitions build pi harness request shapes", () => {
   ]);
   assert.deepEqual(piRequest.mcp_tool_refs, [{ tool_id: "workspace.lookup", server_id: "workspace", tool_name: "lookup" }]);
   assert.equal("output_format" in piRequest, false);
+});
+
+test("shared harness definitions build opencode harness request shapes", () => {
+  const opencodeDefinition = HARNESS_DEFINITIONS.find((d) => d.id === "opencode");
+  assert.ok(opencodeDefinition, "opencode harness definition should exist");
+  const ocRequest = opencodeDefinition!.runtimeAdapter.buildHarnessHostRequest(baseBuildParams());
+
+  assert.equal(ocRequest.system_prompt, "You are concise.");
+  assert.deepEqual(ocRequest.context_messages, []);
+  assert.deepEqual(ocRequest.workspace_skill_dirs, [
+    "/tmp/workspace-1/skills/skill-creator",
+  ]);
+  assert.deepEqual(ocRequest.mcp_tool_refs, [{ tool_id: "workspace.lookup", server_id: "workspace", tool_name: "lookup" }]);
+  assert.equal("output_format" in ocRequest, false);
 });

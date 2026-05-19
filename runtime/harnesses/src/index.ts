@@ -1,4 +1,5 @@
 export { piHarnessDefinition } from "./pi.js";
+export { opencodeHarnessDefinition } from "./opencode.js";
 export * from "./browser-capability-tools.js";
 export * from "./browser-capability-client.js";
 export * from "./capability-http.js";
@@ -18,7 +19,8 @@ export * from "./workspace-boundary.js";
 export * from "./workspace-skills.js";
 
 import { piHarnessDefinition } from "./pi.js";
+import { opencodeHarnessDefinition } from "./opencode.js";
 
 export const DEFAULT_HARNESS_ID = "pi";
 
-export const HARNESS_DEFINITIONS = [piHarnessDefinition] as const;
+export const HARNESS_DEFINITIONS = [piHarnessDefinition, opencodeHarnessDefinition] as const;
