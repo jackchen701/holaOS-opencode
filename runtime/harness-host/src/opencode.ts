@@ -136,7 +136,9 @@ function resolveOpencodeProviderType(modelProxyProvider: string): string {
     default:
       throw new Error(
         `unsupported model_proxy_provider for opencode harness: "${modelProxyProvider}". ` +
-        `supported values: openai_compatible, anthropic_native, google_compatible`,
+        `supported values: openai_compatible (openai, deepseek, zhipu/glm, codingplan, openrouter, etc.), ` +
+        `anthropic_native (anthropic, claude), google_compatible (google, gemini). ` +
+        `this value is resolved by holaOS agent-runtime-config.ts from your provider kind in runtime-config.json.`,
       );
   }
 }
