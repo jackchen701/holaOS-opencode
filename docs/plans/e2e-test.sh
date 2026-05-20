@@ -50,7 +50,11 @@ EOF
 
 # ─── Step 2: Write minimal runtime config ───────────────────────────────────
 
-if [ -n "${OPENAI_API_KEY:-}" ]; then
+# Use pre-written config if available, otherwise generate from env
+if [ -f "/tmp/holaboss-e2e/state/runtime-config.json" ]; then
+  cp /tmp/holaboss-e2e/state/runtime-config.json "${SANDBOX_ROOT}/state/runtime-config.json"
+  log "  Using pre-written runtime-config.json from /tmp/holaboss-e2e"
+elif [ -n "${OPENAI_API_KEY:-}" ]; then
   log "  Using OPENAI_API_KEY from environment"
   cat > "${SANDBOX_ROOT}/state/runtime-config.json" <<EOF
 {
@@ -68,13 +72,13 @@ if [ -n "${OPENAI_API_KEY:-}" ]; then
 }
 EOF
 else
-  log "  WARNING: OPENAI_API_KEY not set. LLM calls will fail."
-  log "  Set OPENAI_API_KEY or configure HOLABOSS_MODEL_PROXY_BASE_URL"
+  log "  WARNING: no runtime-config.json and no OPENAI_API_KEY."
+  log "  Create /tmp/holaboss-e2e/state/runtime-config.json first, or set OPENAI_API_KEY"
   cat > "${SANDBOX_ROOT}/state/runtime-config.json" <<'EOF'
 {
   "runtime": {
     "mode": "oss",
-    "default_model": "openai/gpt-4o-mini"
+    "default_model": "deepseek-custom/deepseek-v4-pro"
   }
 }
 EOF

@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import fs from "node:fs";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import path from "node:path";
 
 import type { HarnessHostOpencodeRequest } from "./opencode-contracts.js";
 import type { RunnerOutputEvent, RunnerEventType, JsonObject } from "./contracts.js";
@@ -33,92 +35,78 @@ export function mapEventV2ToRunnerEvent(
   const base = { session_id: sessionId, input_id: inputId, sequence };
 
   switch (eventV2Type) {
+    case "message.part.updated": {
+      const part = properties.part as Record<string, unknown> | undefined;
+      const delta = properties.delta as string | undefined;
+      const partType = (part as Record<string, unknown>)?.type;
+      if (partType === "tool-invocation") {
+        const toolInv = (part as Record<string, unknown>)?.toolInvocation as Record<string, unknown> | undefined;
+        const state = toolInv?.state as string | undefined;
+        const toolName = toolInv?.toolName as string ?? "unknown";
+        const callId = toolInv?.callId as string ?? "";
+        if (state === "call") {
+          return { ...base, event_type: "tool_call" as RunnerEventType, payload: { phase: "started", tool_name: toolName, call_id: callId, tool_args: toolInv?.args ?? {} } };
+        }
+        if (state === "result") {
+          return { ...base, event_type: "tool_call" as RunnerEventType, payload: { phase: "completed", call_id: callId, error: false, result: toolInv?.result ?? {} } };
+        }
+        return { ...base, event_type: "tool_call" as RunnerEventType, payload: { phase: "in_progress", call_id: callId, progress: toolInv ?? {} } };
+      }
+      if (typeof delta === "string" && delta) {
+        return { ...base, event_type: "output_delta", payload: { delta } };
+      }
+      if (typeof part?.text === "string") {
+        return { ...base, event_type: "output_delta", payload: { delta: part.text as string } };
+      }
+      return null;
+    }
+    case "message.updated": {
+      const info = properties.info as Record<string, unknown> | undefined;
+      if (info?.finish) {
+        const tokens = info.tokens as Record<string, unknown> | undefined;
+        const cost = info.cost as number | undefined;
+        const usage: Record<string, unknown> = {};
+        if (tokens) {
+          usage.input_tokens = tokens.input ?? 0;
+          usage.output_tokens = tokens.output ?? 0;
+          usage.total_tokens = (typeof tokens.input === "number" ? tokens.input : 0) + (typeof tokens.output === "number" ? tokens.output : 0);
+        }
+        if (typeof cost === "number") usage.estimated_cost_usd = cost;
+        return { ...base, event_type: "run_completed" as RunnerEventType, payload: { status: "success", source: "opencode", ...(Object.keys(usage).length > 0 ? { usage } : {}) } };
+      }
+      return null;
+    }
+    case "session.idle":
+      return { ...base, event_type: "run_completed" as RunnerEventType, payload: { status: "success", source: "opencode" } };
+    case "session.error":
+      return { ...base, event_type: "run_failed" as RunnerEventType, payload: { type: "Error", message: (properties.error as Record<string, unknown>)?.message ?? "session error", source: "opencode" } };
+    case "session.status": {
+      const status = properties.status as Record<string, unknown> | undefined;
+      if (status?.type === "error") {
+        return { ...base, event_type: "run_failed" as RunnerEventType, payload: { type: "Error", message: status.message ?? "session status error", source: "opencode" } };
+      }
+      return null;
+    }
     case "session.next.text.delta":
       return { ...base, event_type: "output_delta", payload: { delta: properties.delta ?? "" } };
     case "session.next.reasoning.delta":
       return { ...base, event_type: "thinking_delta", payload: { delta: properties.delta ?? "" } };
     case "session.next.tool.called":
-      return {
-        ...base,
-        event_type: "tool_call" as RunnerEventType,
-        payload: {
-          phase: "started",
-          tool_name: properties.tool ?? "unknown",
-          call_id: properties.callID ?? "",
-          tool_args: properties.input ?? {},
-        },
-      };
-    case "session.next.tool.progress":
-      return {
-        ...base,
-        event_type: "tool_call" as RunnerEventType,
-        payload: {
-          phase: "in_progress",
-          call_id: properties.callID ?? "",
-          progress: properties.structured ?? properties.content ?? {},
-        },
-      };
+      return { ...base, event_type: "tool_call" as RunnerEventType, payload: { phase: "started", tool_name: properties.tool ?? "unknown", call_id: properties.callID ?? "", tool_args: properties.input ?? {} } };
     case "session.next.tool.success":
-      return {
-        ...base,
-        event_type: "tool_call" as RunnerEventType,
-        payload: {
-          phase: "completed",
-          call_id: properties.callID ?? "",
-          error: false,
-          result: properties.content ?? properties.structured ?? {},
-        },
-      };
+      return { ...base, event_type: "tool_call" as RunnerEventType, payload: { phase: "completed", call_id: properties.callID ?? "", error: false, result: properties.content ?? properties.structured ?? {} } };
     case "session.next.tool.failed":
-      return {
-        ...base,
-        event_type: "tool_call" as RunnerEventType,
-        payload: {
-          phase: "completed",
-          call_id: properties.callID ?? "",
-          error: true,
-          result: properties.error ?? { message: "tool failed" },
-        },
-      };
+      return { ...base, event_type: "tool_call" as RunnerEventType, payload: { phase: "completed", call_id: properties.callID ?? "", error: true, result: properties.error ?? { message: "tool failed" } } };
     case "session.next.step.ended": {
       const tokens = properties.tokens as Record<string, unknown> | undefined;
       const cost = properties.cost as number | undefined;
       const usage: Record<string, unknown> = {};
-      if (tokens) {
-        usage.input_tokens = tokens.input ?? 0;
-        usage.output_tokens = tokens.output ?? 0;
-        usage.cached_input_tokens = (tokens.cache as Record<string, unknown>)?.read ?? 0;
-        usage.cache_write_input_tokens = (tokens.cache as Record<string, unknown>)?.write ?? 0;
-        usage.total_tokens =
-          (typeof tokens.input === "number" ? tokens.input : 0) +
-          (typeof tokens.output === "number" ? tokens.output : 0) +
-          (typeof tokens.reasoning === "number" ? tokens.reasoning : 0);
-      }
+      if (tokens) { usage.input_tokens = tokens.input ?? 0; usage.output_tokens = tokens.output ?? 0; usage.total_tokens = (typeof tokens.input === "number" ? tokens.input : 0) + (typeof tokens.output === "number" ? tokens.output : 0); }
       if (typeof cost === "number") usage.estimated_cost_usd = cost;
-      return {
-        ...base,
-        event_type: "run_completed" as RunnerEventType,
-        payload: {
-          status: "success",
-          source: "opencode",
-          ...(Object.keys(usage).length > 0 ? { usage } : {}),
-        },
-      };
+      return { ...base, event_type: "run_completed" as RunnerEventType, payload: { status: "success", source: "opencode", ...(Object.keys(usage).length > 0 ? { usage } : {}) } };
     }
     case "session.next.step.failed":
-      return {
-        ...base,
-        event_type: "run_failed" as RunnerEventType,
-        payload: {
-          type: "Error",
-          message: (properties.error as Record<string, unknown>)?.message ?? "step failed",
-          source: "opencode",
-        },
-      };
-    case "session.next.compaction.started":
-      return { ...base, event_type: "auto_compaction_start", payload: { reason: properties.reason ?? "auto" } };
-    case "session.next.compaction.ended":
-      return { ...base, event_type: "auto_compaction_end", payload: { text: properties.text ?? "" } };
+      return { ...base, event_type: "run_failed" as RunnerEventType, payload: { type: "Error", message: (properties.error as Record<string, unknown>)?.message ?? "step failed", source: "opencode" } };
     default:
       return null;
   }
@@ -140,6 +128,19 @@ function resolveOpencodeProviderType(modelProxyProvider: string): string {
         `anthropic_native (anthropic, claude), google_compatible (google, gemini). ` +
         `this value is resolved by holaOS agent-runtime-config.ts from your provider kind in runtime-config.json.`,
       );
+  }
+}
+
+function npmPackageForProvider(providerType: string): string {
+  switch (providerType) {
+    case "openai":
+      return "@ai-sdk/openai-compatible";
+    case "anthropic":
+      return "@ai-sdk/anthropic";
+    case "google":
+      return "@ai-sdk/google";
+    default:
+      return "@ai-sdk/openai-compatible";
   }
 }
 
@@ -166,28 +167,19 @@ function buildOpencodeConfig(request: HarnessHostOpencodeRequest): Record<string
   }
   const providerType = resolveOpencodeProviderType(modelProxyProvider);
 
-  const providerConfig: Record<string, unknown> = {
-    type: providerType,
-    apiKey: modelClient.api_key,
-    baseURL: modelClient.base_url,
-  };
-  if (modelClient.default_headers && Object.keys(modelClient.default_headers).length > 0) {
-    providerConfig.headers = modelClient.default_headers;
-  }
-
   const mcpServers: Record<string, unknown> = {};
   const runtimeApiUrl = request.runtime_api_base_url;
   if (runtimeApiUrl) {
     mcpServers["holaboss-runtime"] = {
       type: "local",
-      command: process.execPath,
-      args: [import.meta.url.replace(/\/src\/opencode\.ts$/, "/opencode-runtime-mcp-server.mjs")],
-      env: {
+      command: [process.execPath, import.meta.url.replace(/\/src\/opencode\.ts$/, "/opencode-runtime-mcp-server.mjs")],
+      environment: {
         HOLABOSS_RUNTIME_API_URL: runtimeApiUrl,
         HOLABOSS_WORKSPACE_DIR: request.workspace_dir,
         HOLABOSS_SESSION_ID: request.session_id,
         HOLABOSS_INPUT_ID: request.input_id,
       },
+      enabled: true,
     };
   }
   for (const server of request.mcp_servers ?? []) {
@@ -196,17 +188,29 @@ function buildOpencodeConfig(request: HarnessHostOpencodeRequest): Record<string
       mcpServers[name] = server.config ?? {};
     }
   }
-  return {
+  const result: Record<string, unknown> = {
+    model: `holaboss-proxy/${request.model_id}`,
     provider: {
       "holaboss-proxy": {
-        ...providerConfig,
+        name: "holaOS Proxy",
+        npm: npmPackageForProvider(providerType),
+        options: {
+          apiKey: modelClient.api_key,
+          baseURL: modelClient.base_url,
+          ...(modelClient.default_headers && Object.keys(modelClient.default_headers).length > 0
+            ? { headers: modelClient.default_headers }
+            : {}),
+        },
         models: {
-          default: request.model_id,
+          [request.model_id]: { name: request.model_id },
         },
       },
     },
-    mcp: { servers: mcpServers },
   };
+  if (Object.keys(mcpServers).length > 0) {
+    result.mcp = mcpServers;
+  }
+  return result;
 }
 
 async function waitForServerReady(proc: ChildProcess): Promise<string> {
@@ -335,6 +339,90 @@ async function consumeGlobalSSE(
   }
 }
 
+function runtimeContextMessagesBlock(request: HarnessHostOpencodeRequest): string {
+  const messages = Array.isArray(request.context_messages)
+    ? request.context_messages.map((message) => message.trim()).filter(Boolean)
+    : [];
+  if (messages.length === 0) {
+    return "";
+  }
+  return [
+    "Runtime context:",
+    ...messages.map((message, index) =>
+      [`[Runtime Context ${index + 1}]`, message, `[/Runtime Context ${index + 1}]`].join("\n")
+    ),
+  ].join("\n\n");
+}
+
+function injectContextMessages(request: HarnessHostOpencodeRequest): string {
+  const contextBlock = runtimeContextMessagesBlock(request);
+  if (!contextBlock) return request.instruction;
+  return `${contextBlock}\n\n${request.instruction}`;
+}
+
+function symlinkWorkspaceSkills(request: HarnessHostOpencodeRequest): string[] {
+  const skillsDir = path.join(request.workspace_dir, ".opencode", "skills");
+  const createdLinks: string[] = [];
+
+  const skillDirs = request.workspace_skill_dirs ?? [];
+  if (skillDirs.length === 0) return createdLinks;
+
+  fs.mkdirSync(skillsDir, { recursive: true });
+
+  for (const dir of skillDirs) {
+    const name = path.basename(dir);
+    const link = path.join(skillsDir, name);
+    try {
+      if (!fs.existsSync(link)) {
+        fs.symlinkSync(dir, link);
+        createdLinks.push(link);
+      }
+    } catch {
+      // symlink creation is best-effort; skip on failure
+    }
+  }
+
+  return createdLinks;
+}
+
+function cleanupSkillSymlinks(links: string[]): void {
+  for (const link of links) {
+    try {
+      const stat = fs.lstatSync(link);
+      if (stat.isSymbolicLink()) {
+        fs.unlinkSync(link);
+      }
+    } catch {
+      // best-effort cleanup
+    }
+  }
+}
+
+function buildInstructionWithAttachments(request: HarnessHostOpencodeRequest, instruction: string): string {
+  const sections: string[] = [];
+
+  const attachments = request.attachments ?? [];
+  const imageUrls = request.image_urls ?? [];
+
+  if (attachments.length > 0) {
+    const attachmentLines = attachments.map((a) => {
+      const relativePath = a.workspace_path
+        ? `./${a.workspace_path}`
+        : a.name;
+      return `- ${a.name} (${a.kind}, ${a.mime_type}) at ${relativePath}`;
+    });
+    sections.push(["Attachments:", ...attachmentLines].join("\n"));
+  }
+
+  if (imageUrls.length > 0) {
+    const urlLines = imageUrls.map((url, i) => `- [Image URL ${i + 1}] ${url}`);
+    sections.push(["Image URLs:", ...urlLines].join("\n"));
+  }
+
+  if (sections.length === 0) return instruction;
+  return `${sections.join("\n\n")}\n\n${instruction}`;
+}
+
 export async function runOpencode(request: HarnessHostOpencodeRequest): Promise<number> {
   const startTime = Date.now();
   let sequence = 0;
@@ -342,6 +430,7 @@ export async function runOpencode(request: HarnessHostOpencodeRequest): Promise<
   let terminalEmitted = false;
   let proc: ChildProcess | null = null;
   const abortController = new AbortController();
+  let skillLinks: string[] = [];
 
   const idleTimeoutMs = Math.min(
     request.timeout_seconds > 0 ? request.timeout_seconds : OPENCODE_IDLE_TIMEOUT_S,
@@ -360,6 +449,8 @@ export async function runOpencode(request: HarnessHostOpencodeRequest): Promise<
   function cleanup(): void {
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
     if (hardTimer) { clearTimeout(hardTimer); hardTimer = null; }
+    cleanupSkillSymlinks(skillLinks);
+    skillLinks = [];
     if (proc && proc.exitCode === null) {
       proc.kill("SIGKILL");
     }
@@ -372,6 +463,8 @@ export async function runOpencode(request: HarnessHostOpencodeRequest): Promise<
   }
 
   try {
+    skillLinks = symlinkWorkspaceSkills(request);
+
     const config = buildOpencodeConfig(request);
 
     const opencodeBin =
@@ -406,32 +499,27 @@ export async function runOpencode(request: HarnessHostOpencodeRequest): Promise<
       signal: abortController.signal,
     });
     if (!createRes.ok) {
-      throw new Error(`Failed to create opencode session: ${createRes.status}`);
+      const body = await createRes.text().catch(() => "");
+      throw new Error(`Failed to create opencode session: ${createRes.status} ${body.slice(0, 500)}`);
     }
     const session = (await createRes.json()) as { id: string };
     const ocSessionId = session.id;
 
+    const instructionWithContext = injectContextMessages(request);
+    const fullInstruction = buildInstructionWithAttachments(request, instructionWithContext);
+
     const promptPayload: Record<string, unknown> = {
-      content: request.instruction,
+      parts: [{ type: "text", text: fullInstruction }],
+      model: { providerID: "holaboss-proxy", modelID: request.model_id },
     };
 
     if (request.system_prompt) {
       promptPayload.system = request.system_prompt;
     }
 
-    const promptRes = await fetch(`${serverUrl}/session/${ocSessionId}/prompt_async`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-opencode-directory": request.workspace_dir },
-      body: JSON.stringify({ prompt: promptPayload }),
-      signal: abortController.signal,
-    });
-    if (!promptRes.ok && promptRes.status !== 204) {
-      throw new Error(`Failed to send prompt: ${promptRes.status}`);
-    }
-
     resetIdleTimer();
 
-    await consumeGlobalSSE(
+    const ssePromise = consumeGlobalSSE(
       serverUrl,
       request.workspace_dir,
       request.session_id,
@@ -441,6 +529,19 @@ export async function runOpencode(request: HarnessHostOpencodeRequest): Promise<
       () => resetIdleTimer(),
       () => { terminalEmitted = true; },
     );
+
+    const promptRes = await fetch(`${serverUrl}/session/${ocSessionId}/prompt_async`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-opencode-directory": request.workspace_dir },
+      body: JSON.stringify(promptPayload),
+      signal: abortController.signal,
+    });
+    if (!promptRes.ok && promptRes.status !== 204) {
+      const promptBody = await promptRes.text().catch(() => "");
+      throw new Error(`Failed to send prompt: ${promptRes.status} ${promptBody.slice(0, 500)}`);
+    }
+
+    await ssePromise;
 
     if (!terminalEmitted) {
       const status = abortController.signal.aborted ? "timeout" : "success";

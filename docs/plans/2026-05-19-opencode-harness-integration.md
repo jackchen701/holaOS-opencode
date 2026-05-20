@@ -1,6 +1,6 @@
 # OpenCode Harness Integration Plan
 
-Status: **Phase 1-4 Implemented**
+Status: **Phase 1-4 + Phase 6 Implemented**
 Branch: `feat/opencode-harness-integration`
 Created: 2026-05-19
 
@@ -734,3 +734,132 @@ bun test runtime/api-server/src/claimed-input-executor.test.ts
 - [ ] All new test files pass
 - [ ] All existing tests pass (no regressions)
 - [ ] opencode can be upgraded to latest version without breaking holaOS integration
+
+---
+
+## Phase 6: Injection Gap Fixes
+
+Status: **Implemented**
+Added: 2026-05-20
+Completed: 2026-05-20
+
+### Problem
+
+When using the opencode harness, several holaOS features are silently lost because `runOpencode()` receives the data but doesn't use it. The pi harness has rich injection logic; opencode needs equivalent wiring.
+
+### Gap Analysis
+
+| Feature | pi harness | opencode harness | Severity |
+|---------|-----------|-----------------|----------|
+| System prompt | ✅ full (with todo-resume patch) | ⚠ partial (raw, no patch) | Medium |
+| Context messages / Memory | ✅ inlined into prompt | ❌ received but discarded | **Critical** |
+| Workspace skills | ✅ loaded as skill tools | ❌ not loaded or injected | **Critical** |
+| Tool enablement map | ✅ filters enabled tools | ❌ not forwarded | Medium |
+| MCP servers | ✅ direct binding | ✅ via config | OK |
+| Runtime MCP proxy | N/A | ✅ works when API URL present | OK |
+| Attachments | ✅ inlined (base64/text) | ❌ discarded | Medium |
+| Image URLs | ✅ fetched and inlined | ❌ discarded | Medium |
+| Thinking value | ✅ configured | ❌ not forwarded | Low |
+| Browser tools (direct) | ✅ injected | ❌ only via MCP proxy | Low |
+
+### Fix Plan
+
+#### 6.1 Context Messages Injection [Critical]
+
+`request.context_messages` contains recalled memory, user context, scratchpad, evolve candidates, recent runtime context — all composed by `agent-runtime-config.ts`.
+
+**Approach**: Append context messages to the instruction text before sending to opencode.
+
+```typescript
+// In runOpencode(), before building promptPayload:
+let instruction = request.instruction;
+if (request.context_messages?.length) {
+  const contextBlock = request.context_messages
+    .map((msg, i) => `[Runtime Context ${i + 1}]\n${msg}\n[/Runtime Context ${i + 1}]`)
+    .join("\n\n");
+  instruction = `${contextBlock}\n\n${instruction}`;
+}
+```
+
+This mirrors what pi does in `runtimeContextMessagesBlock()`.
+
+#### 6.2 Workspace Skills Injection [Critical]
+
+`request.workspace_skill_dirs` contains paths to skill directories (each has a `SKILL.md` + supporting files).
+
+**Approach**: Symlink each skill directory into `<workspace_dir>/.opencode/skills/<skill_name>/` before spawning opencode. Clean up symlinks after run completes.
+
+```typescript
+// Before spawn:
+const skillsDir = path.join(request.workspace_dir, ".opencode", "skills");
+fs.mkdirSync(skillsDir, { recursive: true });
+
+const skillLinks: string[] = [];
+for (const dir of request.workspace_skill_dirs ?? []) {
+  const name = path.basename(dir);
+  const link = path.join(skillsDir, name);
+  if (!fs.existsSync(link)) {
+    fs.symlinkSync(dir, link);
+    skillLinks.push(link);
+  }
+}
+
+// In cleanup():
+for (const link of skillLinks) {
+  fs.unlinkSync(link);
+}
+```
+
+This leverages opencode's native skill loading from `.opencode/skills/`.
+
+#### 6.3 System Prompt Todo-Resume Patch [Medium]
+
+Pi applies todo-resume instruction patching via `effectiveSystemPromptForRequest()`. Opencode passes the raw system prompt.
+
+**Approach**: Import and apply the same patching function, or extract it into a shared utility.
+
+#### 6.4 Attachments and Image URLs [Medium]
+
+`request.attachments` and `request.image_urls` are received but discarded.
+
+**Approach**: Add attachment parts to the opencode prompt payload's `parts` array:
+
+```typescript
+// Build parts array
+const parts: unknown[] = [{ type: "text", text: instruction }];
+
+for (const url of request.image_urls ?? []) {
+  parts.push({ type: "file", url, mime: "image/png" });
+}
+
+// For attachments, inline text content or reference file paths
+```
+
+#### 6.5 Tool Enablement Map [Medium]
+
+`request.tools` is a `Record<string, boolean>` map of enabled/disabled tools. Opencode gets all MCP tools unfiltered.
+
+**Approach**: Either filter in the runtime MCP proxy (skip calls to disabled tools), or accept that opencode sees all tools and rely on system prompt instructions to guide usage. The latter is simpler and matches opencode's design philosophy.
+
+#### 6.6 Thinking Value [Low]
+
+`request.thinking_value` configures model thinking budget. Opencode's prompt API doesn't expose this directly.
+
+**Approach**: Skip for now. If needed, investigate opencode's model config for thinking/reasoning settings.
+
+### Priority Order
+
+1. Context messages (6.1) — without this, the agent has no memory or context
+2. Workspace skills (6.2) — opencode's native skill mechanism, low-effort symlink
+3. System prompt patch (6.3) — consistency with pi
+4. Attachments (6.4) — needed for file/image inputs
+5. Tool enablement (6.5) — acceptable to defer
+6. Thinking value (6.6) — defer
+
+### Validation
+
+- [ ] Context messages appear in opencode agent's responses
+- [ ] Workspace skills are loaded and callable from opencode agent
+- [ ] Attachments (images, files) are visible to opencode agent
+- [ ] Memory recall works end-to-end (ask about past interactions)
+- [ ] No regressions in existing opencode harness tests
