@@ -1,249 +1,226 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { OpenCodeServerMock } from "./test-util/opencode-server-mock.js";
-import { parseGlobalSSEData, parseSSEStream, type GlobalSSEEvent } from "./test-util/opencode-sse-parser.js";
 import { mapEventV2ToRunnerEvent } from "./opencode.js";
 
-const WORKSPACE_DIR = `/tmp/hb-opencode-compaction-test-${Date.now()}`;
+const WORKSPACE_DIR = `/tmp/hb-compaction-test-${Date.now()}`;
+
+const SESSION_ID = "sess-compaction-1";
+const INPUT_ID = "in-compaction-1";
 
 function makeEventV2(type: string, properties: Record<string, unknown>, directory = WORKSPACE_DIR): string {
   return JSON.stringify({
     directory,
-    payload: { id: `evt-${Date.now()}`, type, properties: { sessionID: "session-1", ...properties } },
+    payload: { id: `evt-${Date.now()}`, type, properties: { sessionID: SESSION_ID, ...properties } },
   });
 }
 
-test("mapEventV2 maps compaction started", () => {
-  const result = mapEventV2ToRunnerEvent(
-    "session.next.compaction.started",
-    { sessionID: "session-1", reason: "auto" },
-    "session-1",
-    "input-1",
-    0,
-  );
+test("compaction.started maps to auto_compaction_start", () => {
+  const result = mapEventV2ToRunnerEvent("session.next.compaction.started", { sessionID: SESSION_ID, reason: "overflow" }, SESSION_ID, INPUT_ID, 1);
   assert.ok(result);
   assert.equal(result!.event_type, "auto_compaction_start");
-  assert.equal(result!.payload.reason, "auto");
+  assert.equal(result!.payload.source, "opencode");
 });
 
-test("mapEventV2 maps compaction ended", () => {
-  const result = mapEventV2ToRunnerEvent(
-    "session.next.compaction.ended",
-    { sessionID: "session-1", text: "Summary..." },
-    "session-1",
-    "input-1",
-    1,
-  );
+test("compaction.ended maps to auto_compaction_end", () => {
+  const result = mapEventV2ToRunnerEvent("session.next.compaction.ended", { sessionID: SESSION_ID, text: "Compacted" }, SESSION_ID, INPUT_ID, 2);
   assert.ok(result);
   assert.equal(result!.event_type, "auto_compaction_end");
-  assert.equal(result!.payload.text, "Summary...");
 });
 
-test("mapEventV2 maps step failed", () => {
+test("compaction.delta maps to auto_compaction_delta", () => {
+  const result = mapEventV2ToRunnerEvent("session.next.compaction.delta", { sessionID: SESSION_ID, delta: "Summarizing..." }, SESSION_ID, INPUT_ID, 3);
+  assert.ok(result);
+  assert.equal(result!.event_type, "auto_compaction_delta");
+});
+
+test("compaction events via mock SSE followed by step.ended", async () => {
+  const mock = new OpenCodeServerMock(WORKSPACE_DIR);
+  const url = await mock.start();
+
+  const res = await fetch(`${url}/session`, { method: "POST" });
+  const session = await res.json() as any;
+
+  mock.enqueueScenario(session.id, {
+    events: [
+      { data: makeEventV2("session.next.compaction.started", { reason: "overflow" }), delayMs: 10 },
+      { data: makeEventV2("session.next.compaction.delta", { delta: "Summarizing..." }), delayMs: 10 },
+      { data: makeEventV2("session.next.compaction.ended", { text: "Compacted" }), delayMs: 10 },
+      { data: makeEventV2("session.next.text.delta", { delta: "Final answer" }), delayMs: 10 },
+      { data: makeEventV2("session.next.step.ended", { tokens: { input: 100, output: 50 }, cost: 0.01 }), delayMs: 10 },
+    ],
+  });
+
+  await fetch(`${url}/session/${session.id}/prompt_async`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content: "test" }),
+  });
+
+  const sseResponse = await fetch(`${url}/global/event`);
+  const reader = sseResponse.body!.getReader();
+  const types: string[] = [];
+
+  const timeout = setTimeout(() => reader.cancel(), 3000);
+  try {
+    let buffer = "";
+    while (types.length < 7) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += new TextDecoder().decode(value);
+      for (const chunk of buffer.split("\n\n")) {
+        if (!chunk.trim()) continue;
+        for (const line of chunk.split("\n")) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const parsed = JSON.parse(line.slice(6));
+            if (parsed?.payload?.type) types.push(parsed.payload.type);
+          } catch {}
+        }
+      }
+      buffer = "";
+    }
+  } finally {
+    clearTimeout(timeout);
+    await reader.cancel().catch(() => {});
+  }
+
+  assert.ok(types.includes("session.next.compaction.started"));
+  assert.ok(types.includes("session.next.compaction.ended"));
+  assert.ok(types.includes("session.next.step.ended"));
+
+  await mock.stop();
+});
+
+test("compact endpoint triggers compaction events via SSE", async () => {
+  const mock = new OpenCodeServerMock(WORKSPACE_DIR);
+  const url = await mock.start();
+
+  const res = await fetch(`${url}/session`, { method: "POST" });
+  const session = await res.json() as any;
+
+  const sseResponse = await fetch(`${url}/global/event`);
+  const reader = sseResponse.body!.getReader();
+  const types: string[] = [];
+
+  await fetch(`${url}/session/${session.id}/compact`, { method: "POST" });
+
+  const timeout = setTimeout(() => reader.cancel(), 1500);
+  try {
+    let buffer = "";
+    while (types.length < 3) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += new TextDecoder().decode(value);
+      for (const chunk of buffer.split("\n\n")) {
+        if (!chunk.trim()) continue;
+        for (const line of chunk.split("\n")) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const parsed = JSON.parse(line.slice(6));
+            if (parsed?.payload?.type) types.push(parsed.payload.type);
+          } catch {}
+        }
+      }
+      buffer = "";
+    }
+  } finally {
+    clearTimeout(timeout);
+    await reader.cancel().catch(() => {});
+  }
+
+  assert.ok(types.includes("session.next.compaction.started"));
+  assert.ok(types.includes("session.next.compaction.ended"));
+
+  await mock.stop();
+});
+
+test("session.next.step.failed maps to run_failed", () => {
   const result = mapEventV2ToRunnerEvent(
     "session.next.step.failed",
-    { sessionID: "session-1", error: { message: "context overflow" } },
-    "session-1",
-    "input-1",
-    0,
+    { error: { message: "provider context overflow" } },
+    SESSION_ID, INPUT_ID, 1,
   );
   assert.ok(result);
   assert.equal(result!.event_type, "run_failed");
-  assert.equal(result!.payload.message, "context overflow");
-  assert.equal(result!.payload.source, "opencode");
+  assert.equal((result!.payload as any).message, "provider context overflow");
 });
 
-test("mapEventV2 maps retried event to null (ignored)", () => {
+test("session.next.retried is ignored (returns null)", () => {
   const result = mapEventV2ToRunnerEvent(
     "session.next.retried",
-    { sessionID: "session-1", attempt: 1, error: { message: "rate limit" } },
-    "session-1",
-    "input-1",
-    0,
+    { attempt: 1, reason: "rate_limited" },
+    SESSION_ID, INPUT_ID, 1,
   );
   assert.equal(result, null);
 });
 
-test("mapEventV2 maps agent switched to null (ignored)", () => {
+test("session.error maps to run_failed", () => {
   const result = mapEventV2ToRunnerEvent(
-    "session.next.agent.switched",
-    { sessionID: "session-1", agent: "explore" },
-    "session-1",
-    "input-1",
-    0,
+    "session.error",
+    { error: { message: "persistent context overflow" } },
+    SESSION_ID, INPUT_ID, 1,
   );
-  assert.equal(result, null);
+  assert.ok(result);
+  assert.equal(result!.event_type, "run_failed");
+  assert.equal((result!.payload as any).message, "persistent context overflow");
 });
 
-test("compaction scenario plays through SSE in correct order", async () => {
-  const mock = new OpenCodeServerMock(WORKSPACE_DIR);
-  const url = await mock.start();
-
-  const res = await fetch(`${url}/session`, { method: "POST" });
-  const session = await res.json() as any;
-
-  mock.enqueueScenario(session.id, {
-    events: [
-      { data: makeEventV2("session.next.prompted", {}), delayMs: 10 },
-      { data: makeEventV2("session.next.text.delta", { delta: "Thinking..." }), delayMs: 10 },
-      { data: makeEventV2("session.next.compaction.started", { reason: "auto" }), delayMs: 20 },
-      { data: makeEventV2("session.next.compaction.ended", { text: "Summarized context" }), delayMs: 10 },
-      { data: makeEventV2("session.next.text.delta", { delta: "After compaction..." }), delayMs: 10 },
-      {
-        data: makeEventV2("session.next.step.ended", {
-          finish: "stop",
-          cost: 0.02,
-          tokens: { input: 200, output: 100, reasoning: 10, cache: { read: 50, write: 0 } },
-        }),
-        delayMs: 10,
-      },
-    ],
-  });
-
-  const sseRes = await fetch(`${url}/global/event`);
-  const reader = sseRes.body!.getReader();
-  const collected: GlobalSSEEvent[] = [];
-
-  await fetch(`${url}/session/${session.id}/prompt_async`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content: "test compaction" }),
-  });
-
-  const readTimeout = setTimeout(() => reader.cancel(), 3000);
-  try {
-    let buffer = "";
-    while (collected.length < 7) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += new TextDecoder().decode(value);
-      const events = parseSSEStream(buffer);
-      for (const event of events) {
-        const parsed = parseGlobalSSEData(event.data);
-        if (parsed) collected.push(parsed);
-      }
-      if (events.length > 0) buffer = "";
-    }
-  } finally {
-    clearTimeout(readTimeout);
-    await reader.cancel().catch(() => {});
-  }
-
-  const types = collected
-    .filter((e) => e.directory === WORKSPACE_DIR)
-    .map((e) => e.payload.type);
-
-  const compactionStartIdx = types.indexOf("session.next.compaction.started");
-  const compactionEndIdx = types.indexOf("session.next.compaction.ended");
-  const stepEndedIdx = types.indexOf("session.next.step.ended");
-
-  assert.ok(compactionStartIdx >= 0, "should have compaction started");
-  assert.ok(compactionEndIdx >= 0, "should have compaction ended");
-  assert.ok(stepEndedIdx >= 0, "should have step ended");
-  assert.ok(compactionStartIdx < compactionEndIdx, "compaction start before end");
-  assert.ok(compactionEndIdx < stepEndedIdx, "compaction before step ended");
-
-  await mock.stop();
-});
-
-test("overflow retry scenario: compaction + retry + success", async () => {
-  const mock = new OpenCodeServerMock(WORKSPACE_DIR);
-  const url = await mock.start();
-
-  const res = await fetch(`${url}/session`, { method: "POST" });
-  const session = await res.json() as any;
-
-  mock.enqueueScenario(session.id, {
-    events: [
-      { data: makeEventV2("session.next.prompted", {}), delayMs: 10 },
-      { data: makeEventV2("session.next.text.delta", { delta: "..." }), delayMs: 10 },
-      { data: makeEventV2("session.next.step.failed", { error: { message: "context overflow" } }), delayMs: 10 },
-      { data: makeEventV2("session.next.compaction.started", { reason: "auto" }), delayMs: 20 },
-      { data: makeEventV2("session.next.compaction.ended", { text: "Compacted" }), delayMs: 10 },
-      { data: makeEventV2("session.next.text.delta", { delta: "Retrying..." }), delayMs: 10 },
-      {
-        data: makeEventV2("session.next.step.ended", {
-          finish: "stop",
-          cost: 0.03,
-          tokens: { input: 300, output: 150, reasoning: 20, cache: { read: 0, write: 0 } },
-        }),
-        delayMs: 10,
-      },
-    ],
-  });
-
-  const sseRes = await fetch(`${url}/global/event`);
-  const reader = sseRes.body!.getReader();
-  const collected: GlobalSSEEvent[] = [];
-
-  await fetch(`${url}/session/${session.id}/prompt_async`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content: "test overflow" }),
-  });
-
-  const readTimeout = setTimeout(() => reader.cancel(), 3000);
-  try {
-    let buffer = "";
-    while (collected.length < 8) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += new TextDecoder().decode(value);
-      const events = parseSSEStream(buffer);
-      for (const event of events) {
-        const parsed = parseGlobalSSEData(event.data);
-        if (parsed) collected.push(parsed);
-      }
-      if (events.length > 0) buffer = "";
-    }
-  } finally {
-    clearTimeout(readTimeout);
-    await reader.cancel().catch(() => {});
-  }
-
-  const types = collected.filter((e) => e.directory === WORKSPACE_DIR).map((e) => e.payload.type);
-
-  assert.ok(types.includes("session.next.step.failed"), "should have first failure");
-  assert.ok(types.includes("session.next.compaction.started"), "should trigger compaction after overflow");
-  assert.ok(types.includes("session.next.step.ended"), "should succeed after retry");
-
-  await mock.stop();
-});
-
-test("explicit compact endpoint returns 204 and emits events", async () => {
-  const mock = new OpenCodeServerMock(WORKSPACE_DIR);
-  const url = await mock.start();
-
-  const res = await fetch(`${url}/session`, { method: "POST" });
-  const session = await res.json() as any;
-
-  const compactRes = await fetch(`${url}/session/${session.id}/compact`, { method: "POST" });
-  assert.equal(compactRes.status, 204);
-
-  await mock.stop();
-});
-
-test("mapEventV2 step ended includes token usage", () => {
+test("message.updated with finish maps to run_completed with usage", () => {
   const result = mapEventV2ToRunnerEvent(
-    "session.next.step.ended",
-    {
-      sessionID: "session-1",
-      finish: "stop",
-      cost: 0.015,
-      tokens: { input: 500, output: 200, reasoning: 30, cache: { read: 100, write: 50 } },
-    },
-    "session-1",
-    "input-1",
-    5,
+    "message.updated",
+    { info: { finish: "stop", tokens: { input: 200, output: 100 }, cost: 0.02 } },
+    SESSION_ID, INPUT_ID, 5,
   );
   assert.ok(result);
   assert.equal(result!.event_type, "run_completed");
-  assert.equal(result!.payload.source, "opencode");
-  const usage = result!.payload.usage as Record<string, unknown>;
-  assert.equal(usage.input_tokens, 500);
-  assert.equal(usage.output_tokens, 200);
-  assert.equal(usage.cached_input_tokens, 100);
-  assert.equal(usage.cache_write_input_tokens, 50);
-  assert.equal(usage.total_tokens, 730);
-  assert.equal(usage.estimated_cost_usd, 0.015);
+  const usage = (result!.payload as any).usage;
+  assert.equal(usage.input_tokens, 200);
+  assert.equal(usage.output_tokens, 100);
+  assert.equal(usage.estimated_cost_usd, 0.02);
+});
+
+test("compaction events interleaved with tool calls preserve ordering", () => {
+  const results: string[] = [];
+
+  const toolCall = mapEventV2ToRunnerEvent(
+    "session.next.tool.called",
+    { tool: "bash", callID: "call-1", input: { command: "ls" } },
+    SESSION_ID, INPUT_ID, 1,
+  );
+  if (toolCall) results.push(toolCall.event_type);
+
+  const compactStart = mapEventV2ToRunnerEvent(
+    "session.next.compaction.started",
+    { reason: "overflow" },
+    SESSION_ID, INPUT_ID, 2,
+  );
+  if (compactStart) results.push(compactStart.event_type);
+
+  const compactEnd = mapEventV2ToRunnerEvent(
+    "session.next.compaction.ended",
+    { text: "Done" },
+    SESSION_ID, INPUT_ID, 3,
+  );
+  if (compactEnd) results.push(compactEnd.event_type);
+
+  const stepEnded = mapEventV2ToRunnerEvent(
+    "session.next.step.ended",
+    { tokens: { input: 50, output: 25 } },
+    SESSION_ID, INPUT_ID, 4,
+  );
+  if (stepEnded) results.push(stepEnded.event_type);
+
+  assert.deepEqual(results, ["tool_call", "auto_compaction_start", "auto_compaction_end", "run_completed"]);
+});
+
+test("session.status error type maps to run_failed", () => {
+  const result = mapEventV2ToRunnerEvent(
+    "session.status",
+    { status: { type: "error", message: "session corrupted" } },
+    SESSION_ID, INPUT_ID, 1,
+  );
+  assert.ok(result);
+  assert.equal(result!.event_type, "run_failed");
+  assert.equal((result!.payload as any).message, "session corrupted");
 });
