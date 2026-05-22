@@ -6,6 +6,8 @@ import { decodeHarnessHostPiRequestBase64 } from "./contracts.js";
 import { flushHarnessSentry, initHarnessSentry } from "./harness-ai-monitoring.js";
 import { requireHarnessHostPluginByCommand } from "./harness-registry.js";
 import { compactPiSession } from "./pi.js";
+import { compactOpencodeSession } from "./opencode.js";
+import { decodeHarnessHostOpencodeRequestBase64, type HarnessHostOpencodeRequest } from "./opencode-contracts.js";
 
 type ReadableRequestStream = Pick<NodeJS.ReadableStream, "setEncoding"> &
   AsyncIterable<string | Buffer>;
@@ -84,6 +86,18 @@ export async function runHarnessHostCli(
     const stdout = deps.stdout ?? process.stdout;
     stdout.write(`${JSON.stringify(result)}\n`);
     return result.error ? 1 : 0;
+  }
+
+  if (command === "compact-opencode-session") {
+    const encoded = await readRequestBase64(
+      args,
+      deps.stdin ?? (process.stdin as ReadableRequestStream),
+    );
+    const request = decodeHarnessHostOpencodeRequestBase64(encoded) as HarnessHostOpencodeRequest;
+    const result = await compactOpencodeSession(request);
+    const stdout = deps.stdout ?? process.stdout;
+    stdout.write(`${JSON.stringify(result)}\n`);
+    return 0;
   }
 
   const resolvePluginByCommand = deps.resolvePluginByCommand ?? requireHarnessHostPluginByCommand;

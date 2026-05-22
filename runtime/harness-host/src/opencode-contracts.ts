@@ -35,6 +35,7 @@ export interface HarnessHostOpencodeRequest {
     base_url?: string | null;
     default_headers?: Record<string, string> | null;
   };
+  opencode_serve_url?: string | null;
 }
 
 export function decodeHarnessHostOpencodeRequestBase64(encoded: string): HarnessHostOpencodeRequest {

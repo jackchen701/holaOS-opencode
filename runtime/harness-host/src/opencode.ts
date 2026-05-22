@@ -9,6 +9,7 @@ import type { RunnerOutputEvent, RunnerEventType, JsonObject } from "./contracts
 const OPENCODE_SERVER_STARTUP_TIMEOUT_MS = 15_000;
 const OPENCODE_IDLE_TIMEOUT_S = 900;
 const OPENCODE_HEARTBEAT_INTERVAL_S = 10;
+const OPENCODE_GRACEFUL_SHUTDOWN_MS = 3_000;
 
 type EventV2Type = string;
 
@@ -19,6 +20,20 @@ interface GlobalSSEEvent {
     type: EventV2Type;
     properties: Record<string, unknown>;
   };
+}
+
+function log(request: HarnessHostOpencodeRequest, level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>): void {
+  const entry = {
+    ts: new Date().toISOString(),
+    level,
+    source: "opencode-harness",
+    session_id: request.session_id,
+    input_id: request.input_id,
+    workspace_id: request.workspace_id,
+    message,
+    ...extra,
+  };
+  process.stderr.write(`${JSON.stringify(entry)}\n`);
 }
 
 function emitRunnerEvent(event: RunnerOutputEvent): void {
@@ -107,6 +122,12 @@ export function mapEventV2ToRunnerEvent(
     }
     case "session.next.step.failed":
       return { ...base, event_type: "run_failed" as RunnerEventType, payload: { type: "Error", message: (properties.error as Record<string, unknown>)?.message ?? "step failed", source: "opencode" } };
+    case "session.next.compaction.started":
+      return { ...base, event_type: "auto_compaction_start" as RunnerEventType, payload: { source: "opencode", reason: properties.reason ?? "auto" } };
+    case "session.next.compaction.ended":
+      return { ...base, event_type: "auto_compaction_end" as RunnerEventType, payload: { source: "opencode" } };
+    case "session.next.compaction.delta":
+      return { ...base, event_type: "auto_compaction_delta" as RunnerEventType, payload: { source: "opencode", delta: properties.delta ?? "" } };
     default:
       return null;
   }
@@ -129,6 +150,23 @@ function resolveOpencodeProviderType(modelProxyProvider: string): string {
         `this value is resolved by holaOS agent-runtime-config.ts from your provider kind in runtime-config.json.`,
       );
   }
+}
+
+function resolveMcpServerScriptPath(): string {
+  const thisUrl = import.meta.url;
+  const srcMatch = thisUrl.match(/^(.*)\/src\/opencode\.ts$/);
+  if (srcMatch) {
+    return `${srcMatch[1]}/src/opencode-runtime-mcp-server.ts`;
+  }
+  const distMatch = thisUrl.match(/^(.*)\/dist\/[^/]+\.mjs$/);
+  if (distMatch) {
+    return `${distMatch[1]}/dist/opencode-runtime-mcp-server.mjs`;
+  }
+  const dirMatch = thisUrl.match(/^(.*)\/[^/]+\.(ts|mjs)$/);
+  if (dirMatch) {
+    return `${dirMatch[1]}/opencode-runtime-mcp-server.mjs`;
+  }
+  throw new Error(`cannot resolve MCP server path from import.meta.url: ${thisUrl}`);
 }
 
 function npmPackageForProvider(providerType: string): string {
@@ -170,9 +208,10 @@ function buildOpencodeConfig(request: HarnessHostOpencodeRequest): Record<string
   const mcpServers: Record<string, unknown> = {};
   const runtimeApiUrl = request.runtime_api_base_url;
   if (runtimeApiUrl) {
+    const mcpServerScript = resolveMcpServerScriptPath();
     mcpServers["holaboss-runtime"] = {
       type: "local",
-      command: [process.execPath, import.meta.url.replace(/\/src\/opencode\.ts$/, "/opencode-runtime-mcp-server.mjs")],
+      command: [process.execPath, mcpServerScript],
       environment: {
         HOLABOSS_RUNTIME_API_URL: runtimeApiUrl,
         HOLABOSS_WORKSPACE_DIR: request.workspace_dir,
@@ -431,6 +470,12 @@ export async function runOpencode(request: HarnessHostOpencodeRequest): Promise<
   let proc: ChildProcess | null = null;
   const abortController = new AbortController();
   let skillLinks: string[] = [];
+  let procExitCode: number | null = null;
+  let procExited = false;
+  let procExitPromise: Promise<never> | null = null;
+
+  const attachUrl = request.opencode_serve_url ?? process.env.OPENCODE_SERVE_URL ?? null;
+  const isAttachMode = !!attachUrl;
 
   const idleTimeoutMs = Math.min(
     request.timeout_seconds > 0 ? request.timeout_seconds : OPENCODE_IDLE_TIMEOUT_S,
@@ -442,6 +487,7 @@ export async function runOpencode(request: HarnessHostOpencodeRequest): Promise<
   function resetIdleTimer(): void {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
+      log(request, "warn", "Idle timeout triggered", { idleTimeoutMs });
       abortController.abort();
     }, idleTimeoutMs);
   }
@@ -451,13 +497,25 @@ export async function runOpencode(request: HarnessHostOpencodeRequest): Promise<
     if (hardTimer) { clearTimeout(hardTimer); hardTimer = null; }
     cleanupSkillSymlinks(skillLinks);
     skillLinks = [];
-    if (proc && proc.exitCode === null) {
-      proc.kill("SIGKILL");
+    if (proc && !procExited) {
+      try {
+        proc.kill("SIGTERM");
+        const deadline = Date.now() + OPENCODE_GRACEFUL_SHUTDOWN_MS;
+        while (!procExited && Date.now() < deadline) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+        }
+        if (!procExited) {
+          proc.kill("SIGKILL");
+        }
+      } catch {
+        try { proc.kill("SIGKILL"); } catch {}
+      }
     }
   }
 
   if (request.timeout_seconds > 0) {
     hardTimer = setTimeout(() => {
+      log(request, "warn", "Hard timeout triggered", { timeoutSeconds: request.timeout_seconds });
       abortController.abort();
     }, request.timeout_seconds * 1000);
   }
@@ -465,22 +523,48 @@ export async function runOpencode(request: HarnessHostOpencodeRequest): Promise<
   try {
     skillLinks = symlinkWorkspaceSkills(request);
 
-    const config = buildOpencodeConfig(request);
+    let serverUrl: string;
 
-    const opencodeBin =
-      process.env.HOLABOSS_OPENCODE_BIN ??
-      (process.env.HOME ? `${process.env.HOME}/.opencode/bin/opencode` : "opencode");
+    if (isAttachMode) {
+      serverUrl = attachUrl!;
+      log(request, "info", "Attach mode: connecting to existing opencode serve", { url: serverUrl });
+    } else {
+      const config = buildOpencodeConfig(request);
+      const opencodeBin =
+        process.env.HOLABOSS_OPENCODE_BIN ??
+        (process.env.HOME ? `${process.env.HOME}/.opencode/bin/opencode` : "opencode");
 
-    proc = spawn(opencodeBin, ["serve", "--port=0"], {
-      cwd: request.workspace_dir,
-      env: {
-        ...process.env,
-        OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
-      },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+      log(request, "info", "Fallback mode: spawning opencode serve", { bin: opencodeBin, model: request.model_id });
 
-    const serverUrl = await waitForServerReady(proc);
+      proc = spawn(opencodeBin, ["serve", "--port=0"], {
+        cwd: request.workspace_dir,
+        env: {
+          ...process.env,
+          OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+        detached: true,
+      });
+
+      proc.unref();
+
+      procExitPromise = new Promise<never>((_resolve, reject) => {
+        proc!.once("exit", (code) => {
+          procExitCode = code;
+          procExited = true;
+          if (!terminalEmitted && !abortController.signal.aborted) {
+            reject(new Error(`opencode server process exited unexpectedly with code ${code}`));
+          }
+        });
+      });
+
+      serverUrl = await Promise.race([
+        waitForServerReady(proc),
+        procExitPromise,
+      ]);
+
+      log(request, "info", "opencode serve ready", { url: serverUrl });
+    }
 
     emitRunnerEvent({
       session_id: request.session_id,
@@ -541,10 +625,21 @@ export async function runOpencode(request: HarnessHostOpencodeRequest): Promise<
       throw new Error(`Failed to send prompt: ${promptRes.status} ${promptBody.slice(0, 500)}`);
     }
 
-    await ssePromise;
+    log(request, "info", "Prompt sent, awaiting SSE events");
+
+    if (procExitPromise) {
+      await Promise.race([ssePromise, procExitPromise]);
+    } else {
+      await ssePromise;
+    }
 
     if (!terminalEmitted) {
       const status = abortController.signal.aborted ? "timeout" : "success";
+      log(request, status === "timeout" ? "warn" : "info", "SSE ended without terminal event", {
+        aborted: abortController.signal.aborted,
+        procExited,
+        procExitCode,
+      });
       emitRunnerEvent({
         session_id: request.session_id,
         input_id: request.input_id,
@@ -558,10 +653,17 @@ export async function runOpencode(request: HarnessHostOpencodeRequest): Promise<
           duration_ms: Date.now() - startTime,
         },
       });
+    } else {
+      log(request, "info", "Run completed", { durationMs: Date.now() - startTime });
     }
 
     return terminalEmitted && !abortController.signal.aborted ? 0 : 1;
   } catch (error) {
+    log(request, "error", "Run failed", {
+      error: error instanceof Error ? error.message : String(error),
+      procExited,
+      procExitCode,
+    });
     if (!terminalEmitted) {
       emitRunnerEvent({
         session_id: request.session_id,
@@ -588,6 +690,8 @@ export async function compactOpencodeSession(request: HarnessHostOpencodeRequest
     process.env.HOLABOSS_OPENCODE_BIN ??
     (process.env.HOME ? `${process.env.HOME}/.opencode/bin/opencode` : "opencode");
 
+  let procExited = false;
+
   const proc = spawn(opencodeBin, ["serve", "--port=0"], {
     cwd: request.workspace_dir,
     env: {
@@ -595,7 +699,11 @@ export async function compactOpencodeSession(request: HarnessHostOpencodeRequest
       OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
     },
     stdio: ["pipe", "pipe", "pipe"],
+    detached: true,
   });
+
+  proc.unref();
+  proc.once("exit", () => { procExited = true; });
 
   try {
     const serverUrl = await waitForServerReady(proc);
@@ -610,6 +718,12 @@ export async function compactOpencodeSession(request: HarnessHostOpencodeRequest
 
     return { compacted: res.ok || res.status === 204 };
   } finally {
-    if (proc.exitCode === null) proc.kill("SIGKILL");
+    if (!procExited) {
+      try { proc.kill("SIGTERM"); } catch {}
+      await new Promise((resolve) => setTimeout(resolve, OPENCODE_GRACEFUL_SHUTDOWN_MS));
+      if (!procExited) {
+        try { proc.kill("SIGKILL"); } catch {}
+      }
+    }
   }
 }

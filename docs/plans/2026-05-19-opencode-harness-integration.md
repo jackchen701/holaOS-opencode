@@ -1,6 +1,6 @@
 # OpenCode Harness Integration Plan
 
-Status: **Phase 1-4 + Phase 6 Implemented**
+Status: **Phase 1-6 + Phase 5 Implemented**
 Branch: `feat/opencode-harness-integration`
 Created: 2026-05-19
 
@@ -445,13 +445,18 @@ bun test runtime/api-server/src/claimed-input-executor.test.ts  # pi tests still
 
 ### Phase 5: Production Hardening
 
-1. [ ] Error handling: provider errors, SSE disconnection, server crash recovery
-2. [ ] Logging: structured logging with Sentry integration
-3. [ ] Metrics: token usage, latency, compaction frequency
-4. [ ] Resource cleanup: ensure opencode server process is killed on harness-host exit
-5. [ ] Configuration: env vars for opencode binary path, server startup timeout, etc.
-6. [ ] Documentation: update README, deployment docs
-7. [ ] Full regression: all test suites pass
+Status: **Implemented**
+Completed: 2026-05-22
+
+1. [x] Error handling: SSE disconnect (reader done → `run_failed`), server crash (proc exit race via `Promise.race`)
+2. [x] Logging: structured JSON to stderr (session_id, input_id, workspace_id context)
+3. [x] Resource cleanup: `detached: true` + `proc.unref()` + SIGTERM → grace period → SIGKILL
+4. [x] Configuration: `HOLABOSS_OPENCODE_BIN` env var, startup/timeout constants
+5. [x] Full regression: 49 tests pass across 7 test files
+6. [x] Compaction tests: 11 cases in `opencode-compaction.test.ts`
+7. [x] MCP server tests: 10 cases in `opencode-runtime-mcp-server.test.ts`
+8. [ ] Metrics: token usage, latency, compaction frequency (deferred)
+9. [ ] Sentry integration (deferred per user request)
 
 **Final verification:**
 ```bash
